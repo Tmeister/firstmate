@@ -275,6 +275,17 @@ If a task's thread no longer reads back, release the task by hand:
    Remove its line from the parent's `data/secondmates.md`.
 4. Remove the task record, `state/<id>.meta`, and its other `state/<id>.*` files.
 
+## Lost wakes after T3's idle release (the doorbell)
+
+T3 releases an idle agent process after 30 minutes, and every Claude arm lives inside that process, so without help a supervisor in a T3 thread stops hearing from its workers until the next human message.
+The opt-in doorbell, `bin/fm-t3-bell.sh`, closes that gap: one detached process per home, outside T3's process group, keeps the home's one watcher cycle alive and, when queued wakes go undelivered, sends a short message into the supervisor's thread, which makes T3 resume the same conversation for a wake-handling turn.
+Turn it on with `config/t3-bell` and `config/supervision-host-off`, because the supervision host runs inside the agent process and the bell does not run it yet.
+Session start then launches the bell, which finds the supervisor's thread by the same cwd match as away-mode discovery while that turn is active; `bin/fm-t3-bell.sh start <thread-id>` names it explicitly.
+Deleting `config/t3-bell` is the off switch: a running bell exits within one tick.
+The bell rings only a settled thread, waits a grace period so a live Stop hook delivers first, and sends one message per newest queued wake under one client request id, so it neither doubles the watcher nor duplicates a delivery.
+The script's header owns its tick, grace, retry, and delivery rules, and `bin/fm-t3-bell.sh status` reports whether it runs and which thread it rings.
+Away mode leaves supervision to the away daemon.
+
 ## Active limits
 
 - T3 Code remains experimental and runs only `claude` and `codex`.
@@ -290,13 +301,14 @@ If a task's thread no longer reads back, release the task by hand:
 - A tracked `.codex/config.toml` that already defines `[shell_environment_policy]` is refused by file and table name before a slot is leased.
 - While a tracked Codex overlay is installed, do not edit that file or clear its `skip-worktree` flag; configuration changes require cleanup first.
 - Shell typing and Ctrl-U are unsupported; runtime Escape and Ctrl-C still interrupt the turn.
+- The doorbell does not yet run the supervision host, re-ring a delivered doorbell the supervisor left unhandled, or survive a reboot until the next session start.
 - A Codex supervisor has no away mode on this backend because it has no tracked background tool for `start-native`, and T3 has no terminal for `start` to create.
 - T3 checkpoints each turn as hidden refs under `refs/t3/orchestration-v2/checkpoints/` in the project clone; they are never pushed and do not affect the landed-work test.
 
 ## Regression entry points
 
 ```sh
-bin/fm-test-run.sh tests/fm-t3-mcp.test.sh tests/fm-backend-t3code.test.sh
+bin/fm-test-run.sh tests/fm-t3-mcp.test.sh tests/fm-backend-t3code.test.sh tests/fm-t3-bell.test.sh
 bin/fm-test-run.sh tests/fm-backend.test.sh tests/fm-daemon.test.sh tests/fm-control.test.sh
 FM_CONFIG_OVERRIDE=<home>/config bin/fm-test-run.sh tests/fm-backend-t3code-live-e2e.test.sh
 FM_T3CODE_PR_TOOLS_LIVE=1 FM_CONFIG_OVERRIDE=<home>/config bin/fm-test-run.sh tests/fm-backend-t3code-pr-tools-live-e2e.test.sh
