@@ -13,6 +13,9 @@
 #
 # Opt-in and off switch: config/t3-bell (any content). Absent, `start` does
 # nothing and a running bell exits within one tick.
+# The bell also requires config/supervision-host-off: the supervision host
+# (docs/supervision-host.md) runs inside the agent process like every other arm,
+# and the bell does not yet run it, so a home with the bell runs without it.
 #
 # Each tick (FM_T3_BELL_TICK seconds, default 10):
 #   - Watcher: while the home needs supervision (bin/fm-supervision-lib.sh) and
@@ -199,6 +202,10 @@ cmd_run() {
   local thread
   mkdir -p "$STATE" || exit 1
   [ -f "$SWITCH" ] || { log "not started: $SWITCH is absent"; exit 0; }
+  [ -e "$CONFIG/supervision-host-off" ] || {
+    log "not started: the bell needs the supervision host off ($CONFIG/supervision-host-off)"
+    exit 1
+  }
   if ! fm_lock_try_acquire "$LOCK"; then
     echo "t3-bell: already running pid=${FM_LOCK_HELD_PID:-unknown}"
     exit 0
@@ -239,6 +246,10 @@ cmd_start() {
     shift
   done
   [ -f "$SWITCH" ] || { echo "t3-bell: off ($SWITCH is absent)"; exit 0; }
+  [ -e "$CONFIG/supervision-host-off" ] || {
+    echo "t3-bell: refused - the bell needs the supervision host off; create $CONFIG/supervision-host-off" >&2
+    exit 1
+  }
   if pid=$(bell_pid); then
     echo "t3-bell: running pid=$pid thread=$(cat "$THREAD_FILE" 2>/dev/null)"
     exit 0

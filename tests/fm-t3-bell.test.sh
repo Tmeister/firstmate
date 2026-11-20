@@ -45,6 +45,7 @@ exec sleep "\${FM_TEST_ARM_SECS:-600}"
 SH
   chmod +x "$HOME_DIR/bin/fm-watch-arm.sh"
   : > "$HOME_DIR/config/t3-bell"
+  : > "$HOME_DIR/config/supervision-host-off"
   t3_fake_case "$CASE_DIR"
   case "$status" in running) run='"run-1"' ;; esac
   FM_T3_STATUS=$status FM_T3_RUN=$run t3_fake_set '
@@ -101,6 +102,11 @@ test_off_by_default() {
   out=$(FM_HOME="$HOME_DIR" "$HOME_DIR/bin/fm-t3-bell.sh" start thread-sup 2>&1)
   assert_contains "$out" "t3-bell: off" "start without config/t3-bell does nothing"
   assert_equals "t3-bell: stopped" "$(FM_HOME="$HOME_DIR" "$HOME_DIR/bin/fm-t3-bell.sh" status)" "no bell runs when off"
+  : > "$HOME_DIR/config/t3-bell"
+  rm -f "$HOME_DIR/config/supervision-host-off"
+  out=$(FM_HOME="$HOME_DIR" "$HOME_DIR/bin/fm-t3-bell.sh" start thread-sup 2>&1) && fail "start ran with the supervision host on"
+  assert_contains "$out" "supervision-host-off" "start refuses while the supervision host is on"
+  assert_equals "t3-bell: stopped" "$(FM_HOME="$HOME_DIR" "$HOME_DIR/bin/fm-t3-bell.sh" status)" "no bell runs beside the supervision host"
   pass "off by default"
 }
 
