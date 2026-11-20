@@ -2,7 +2,7 @@
 # Check, and optionally repair, one remote account's second-mate readiness.
 #
 # Usage:
-#   bin/fm-on.sh <secondmate-id|ssh-alias> fm-remote-doctor.sh [--fix [--automatic]] [--backend herdr|rex|any]
+#   bin/fm-on.sh <secondmate-id|ssh-alias> fm-remote-doctor.sh [--fix [--automatic]] [--backend herdr|rex|t3code|any]
 #
 # Run it through fm-on.sh so the fixed entrypoint invokes this readiness owner
 # over its plain SSH bootstrap. The command reports the same filesystem-composed
@@ -33,7 +33,14 @@
 # the account's personal unix socket, which is detached from every SSH session;
 # --fix may run `rex server start` when no server answers, but never installs
 # the CLI and never stops or restarts an answering server: an exit-when-empty
-# server is a human gap that needs an operator-scheduled restart. The remote job
+# server is a human gap that needs an operator-scheduled restart. On the T3
+# backend (never chosen by `any`) the account needs the t3 and node CLIs, a
+# loopback T3 server with telemetry off, and the code root's credential,
+# config/t3code-token (or FM_T3CODE_TOKEN_FILE), signed in and not within five
+# days of expiry; on Linux the server must also be the enabled t3code.service
+# systemd user unit with lingering on, so it survives logout and reboot. --fix
+# may only start that installed, stopped unit; installing T3 or the unit,
+# enabling linger, and signing in stay human gaps. The remote job
 # worker is backend-independent, so its Aqua login-session requirement is
 # checked under either backend. Doctor remains invokable over the plain-SSH
 # bootstrap path to inspect and repair that worker. SSH cannot create an Aqua
@@ -133,10 +140,10 @@ while [ "$#" -gt 0 ]; do
     --automatic) AUTOMATIC=1 ;;
     --backend)
       shift
-      case "${1:-}" in herdr | rex | any) DOCTOR_BACKEND=$1 ;; *) usage ;; esac
+      case "${1:-}" in herdr | rex | t3code | any) DOCTOR_BACKEND=$1 ;; *) usage ;; esac
       ;;
     --backend=*)
-      case "${1#--backend=}" in herdr | rex | any) DOCTOR_BACKEND=${1#--backend=} ;; *) usage ;; esac
+      case "${1#--backend=}" in herdr | rex | t3code | any) DOCTOR_BACKEND=${1#--backend=} ;; *) usage ;; esac
       ;;
     --worker-tool-probe)
       [ "${FM_REMOTE_JOB_ACTIVE:-}" = 1 ] || { printf 'error: worker tool probe requires the remote job worker\n' >&2; exit 64; }
@@ -164,6 +171,7 @@ if [ "$DOCTOR_BACKEND" = any ]; then
 fi
 case "$DOCTOR_BACKEND" in
   herdr | rex) REQUIRED_TOOLS=(git jq "$DOCTOR_BACKEND" tasks-axi treehouse) ;;
+  t3code) REQUIRED_TOOLS=(git jq t3 tasks-axi treehouse) ;;
   *) REQUIRED_TOOLS=(git jq backend tasks-axi treehouse) ;;
 esac
 if [ "$DOCTOR_BACKEND" = herdr ] && [ "$MODE" != worker-tool-probe ]; then
@@ -603,7 +611,7 @@ report_required_tools_from_worker() {
   # probe reports `backend=MISSING` rather than resolving differently.
   local -a probe_args=(--worker-tool-probe)
   case "$DOCTOR_BACKEND" in
-    herdr | rex) probe_args+=(--backend "$DOCTOR_BACKEND") ;;
+    herdr | rex | t3code) probe_args+=(--backend "$DOCTOR_BACKEND") ;;
   esac
   if ! job_id=$(fm_remote_job_stage "${HOME:-}" "$FM_ROOT" "${FM_HOME:-}" \
     fm-remote-doctor.sh "${probe_args[@]}" </dev/null); then
@@ -628,7 +636,7 @@ report_required_tools_from_worker() {
     fact=${line#required }
     name=${fact%%=*}
     value=${fact#*=}
-    case "$name" in git | jq | herdr | rex | backend | tasks-axi | treehouse | harness) ;; *) valid=0; continue ;; esac
+    case "$name" in git | jq | herdr | rex | t3 | backend | tasks-axi | treehouse | harness) ;; *) valid=0; continue ;; esac
     case "$seen" in *" $name "*) valid=0; continue ;; esac
     seen="$seen$name "
     count=$((count + 1))
@@ -861,6 +869,118 @@ start_rex_server() {
   return 1
 }
 
+# --- T3 backend ---------------------------------------------------------------
+
+T3_TOKEN_FILE="${FM_T3CODE_TOKEN_FILE:-$FM_ROOT/config/t3code-token}"
+T3_LOGIN_ACTION="on that host, as this account, run: node '$FM_ROOT/bin/fm-t3-mcp.mjs' login --access full-access --token-file '$T3_TOKEN_FILE'"
+
+check_t3() {
+  local t3 node
+  if ! t3=$(command -v t3 2>/dev/null) || [ ! -x "$t3" ]; then
+    record t3 "human: the t3 CLI does not resolve on the remote runtime PATH" \
+      "install T3 Code on that account (for example 'npm install -g t3'), or add a ~/.local/bin wrapper for it; the remote second mate's t3code backend needs this CLI"
+    return 0
+  fi
+  if ! node=$(command -v node 2>/dev/null) || [ ! -x "$node" ]; then
+    record t3 "human: node does not resolve on the remote runtime PATH, so Firstmate cannot talk to T3" \
+      "install Node.js on that account, or add a ~/.local/bin wrapper for it"
+    return 0
+  fi
+  record t3 "ok: $t3 (node $node)"
+}
+
+# Linux keeps the server alive through a systemd user unit plus lingering; a
+# macOS host has no such unit, so its T3 server is the captain's to keep running
+# and only the server check below applies.
+check_t3_service() {
+  local user linger
+  if [ "$PLATFORM" != linux ]; then
+    record t3-service "skip: the t3code systemd user service applies only on linux; keep T3 running on $PLATFORM yourself"
+    return 0
+  fi
+  if ! command -v systemctl >/dev/null 2>&1 || ! command -v loginctl >/dev/null 2>&1; then
+    record t3-service "human: systemctl or loginctl does not resolve, so the T3 service cannot be inspected" \
+      "run T3 under systemd on that account ('t3 service install'), then rerun this command"
+    return 0
+  fi
+  user=$(id -un 2>/dev/null || true)
+  linger=$(loginctl show-user "$user" --property=Linger --value 2>/dev/null || true)
+  if [ "$linger" = yes ]; then
+    record t3-linger "ok: lingering is on for $user"
+  else
+    record t3-linger "human: lingering is off for ${user:-this account}, so T3 stops at logout and does not start at boot" \
+      "run 'sudo loginctl enable-linger ${user:-<user>}' on that host"
+  fi
+  if systemctl --user is-active --quiet t3code.service 2>/dev/null; then
+    record t3-service "ok: t3code.service is active"
+  elif systemctl --user is-enabled --quiet t3code.service 2>/dev/null; then
+    record t3-service "fixable: t3code.service is installed but not running" \
+      "rerun this command with --fix to start it"
+  else
+    record t3-service "human: no enabled t3code.service systemd user unit" \
+      "run 't3 service install' on that account, set T3CODE_HOST=127.0.0.1 and T3CODE_TELEMETRY_ENABLED=false in ~/.t3/service.env, then 't3 service restart'"
+  fi
+}
+
+start_t3_service() {
+  if systemctl --user start t3code.service >/dev/null 2>&1; then
+    fix_report t3-service applied "started t3code.service"
+    return 0
+  fi
+  fix_report t3-service failed "t3code.service did not start"
+  return 1
+}
+
+# One status call proves the credential, that this host's server answers it,
+# and the capability gate (bin/fm-t3-mcp.mjs status owns those checks).
+check_t3_server() {
+  local out err rc origin host telemetry days version
+  if ! command -v node >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+    record t3-server "human: T3 cannot be checked without both node and jq on the runtime PATH" \
+      "install the missing tool reported above, then rerun this command"
+    return 0
+  fi
+  if [ ! -f "$T3_TOKEN_FILE" ]; then
+    record t3-server "human: no T3 credential at $T3_TOKEN_FILE" "$T3_LOGIN_ACTION"
+    return 0
+  fi
+  err=$(mktemp "${TMPDIR:-/tmp}/fm-doctor-t3.XXXXXX") || { record t3-server "human: no scratch file for the T3 status check"; return 0; }
+  rc=0
+  out=$(node "$SCRIPT_DIR/fm-t3-mcp.mjs" status --token-file "$T3_TOKEN_FILE" 2>"$err") || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    record t3-server "human: T3 status failed: $(head -1 "$err")" \
+      "make sure this host's T3 server is running; if the credential expired or was revoked, $T3_LOGIN_ACTION"
+    rm -f "$err"
+    return 0
+  fi
+  rm -f "$err"
+  origin=$(printf '%s' "$out" | jq -r '.origin // empty' 2>/dev/null)
+  telemetry=$(printf '%s' "$out" | jq -r '.telemetry // empty' 2>/dev/null)
+  days=$(printf '%s' "$out" | jq -r '.daysLeft // empty' 2>/dev/null)
+  version=$(printf '%s' "$out" | jq -r '.serverVersion // empty' 2>/dev/null)
+  host=${origin#*://}
+  host=${host%%/*}
+  host=${host%:*}
+  case "$host" in
+    127.0.0.1 | localhost | '[::1]') ;;
+    *)
+      record t3-server "human: the T3 credential names $origin, not a loopback server" \
+        "keep T3CODE_HOST=127.0.0.1 for this account's T3 server, then sign in again: $T3_LOGIN_ACTION"
+      return 0
+      ;;
+  esac
+  if [ "$telemetry" != off ]; then
+    record t3-server "human: T3 telemetry at $origin is ${telemetry:-unknown}, not off" \
+      "set T3CODE_TELEMETRY_ENABLED=false for this account's T3 server (~/.t3/service.env on linux), then restart it"
+    return 0
+  fi
+  if [ "${days%%.*}" -lt 5 ] 2>/dev/null; then
+    record t3-server "human: the T3 credential expires in $days days" "$T3_LOGIN_ACTION"
+    return 0
+  fi
+  record t3-server "ok: T3 ${version:-unknown} at $origin, telemetry off, credential valid for $days days"
+}
+
 check_gui_session() {
   if [ "$PLATFORM" != darwin ]; then
     record gui-session "skip: no Aqua login session applies on $PLATFORM"
@@ -1063,6 +1183,7 @@ run_checks() { # <resolved-login-shell>
   case "$DOCTOR_BACKEND" in
     herdr) check_herdr ;;
     rex) check_rex ;;
+    t3code) check_t3 ;;
     *) check_backend ;;
   esac
   check_gui_session
@@ -1076,6 +1197,10 @@ run_checks() { # <resolved-login-shell>
       check_herdr_server
       ;;
     rex) check_rex_server ;;
+    t3code)
+      check_t3_service
+      check_t3_server
+      ;;
   esac
   check_entrypoint_link
 }
@@ -1336,6 +1461,7 @@ apply_fixes() { # <resolved-login-shell>
         fi
         ;;
       rex-server) start_rex_server || true ;;
+      t3-service) start_t3_service || true ;;
       entrypoint-link) link_entrypoint || true ;;
     esac
   done

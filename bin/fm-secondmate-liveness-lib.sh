@@ -202,7 +202,7 @@ fm_secondmate_liveness_probe() {  # <meta> <id> <full|poll>
           fi
           remote_backend=$(printf '%s\n' "$route_out" | sed -n 's/^backend=//p' | tail -1)
           case "$remote_backend" in
-            herdr | rex) ;;
+            herdr | rex | t3code) ;;
             *)
               FM_SM_LIVE_REASON="alive remote endpoint is recorded on backend '${remote_backend:-missing}'; migrate or retire it explicitly"
               return 0
@@ -219,6 +219,10 @@ fm_secondmate_liveness_probe() {  # <meta> <id> <full|poll>
       dead|missing)
         FM_SM_LIVE_STATUS=relaunchable
         FM_SM_LIVE_CAUSE="remote endpoint $agent_state on its configured host"
+        # The host's launch verb resumes a failed T3 run in place rather than
+        # replacing its thread (bin/fm-remote-secondmate-control.sh).
+        [ "$agent_state:$expected_remote_backend" != dead:t3code ] \
+          || FM_SM_LIVE_CAUSE="a failed run on its remote T3 thread, resumed in place by its host"
         FM_SM_LIVE_WHERE="host=$remote_host"
         ;;
       ambiguous|unreadable|unverified)

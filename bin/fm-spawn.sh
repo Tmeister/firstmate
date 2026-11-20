@@ -1454,7 +1454,8 @@ spawn_remote_secondmate() {
   # A remote second mate runs only on a backend whose session-provider server
   # outlives every SSH connection that supervises it: herdr (its server belongs
   # to the host's GUI login session) is the default; rex runs on the host's
-  # persistent personal rex server. Without an explicit selection a relaunch
+  # persistent personal rex server; t3code runs on the host's own T3 system
+  # service. Without an explicit selection a relaunch
   # keeps the backend its record names, and a record written before rex
   # existed names none, so it is herdr. bin/fm-remote-doctor.sh gates that host
   # on the selected backend, and the remote home's config/backend never
@@ -1465,11 +1466,11 @@ spawn_remote_secondmate() {
   fi
   case "${backend:--}" in
   -) backend=herdr ;;
-  herdr | rex) ;;
+  herdr | rex | t3code) ;;
   *)
     fm_lock_release "$registry_lock" || true
     fm_lock_release "$SPAWN_TASK_LOCK" || true
-    echo "error: a remote secondmate runs only on the herdr or rex backend, not '$backend'" >&2
+    echo "error: a remote secondmate runs only on the herdr, rex, or t3code backend, not '$backend'" >&2
     return 1
     ;;
   esac
@@ -1617,6 +1618,18 @@ spawn_remote_secondmate() {
         echo "error: remote launch returned malformed Rex route metadata (session '${remote_rex_session_id:-missing}', server '${remote_rex_server:-missing}', target '${remote_target:-missing}'); preserving the remote route for reconciliation" >&2
         return 1
       fi
+      ;;
+    t3code)
+      # The target is the T3 thread id the host's own server assigned.
+      case "$remote_target" in
+        *[!A-Za-z0-9._:-]*)
+          fm_lock_release "$remote_lock" || true
+          fm_lock_release "$registry_lock" || true
+          fm_lock_release "$SPAWN_TASK_LOCK" || true
+          echo "error: remote launch returned malformed T3 thread id '$remote_target'; preserving the remote route for reconciliation" >&2
+          return 1
+          ;;
+      esac
       ;;
   esac
   # Record what the remote endpoint ACTUALLY carries, read back from its own
@@ -5425,10 +5438,28 @@ EOF
     T3CODE_MODEL_SELECTION=$(fm_backend_t3code_model_selection "$HARNESS" "${MODEL:-default}" "${EFFORT:-default}" "$T3CODE_PROJECT_ID") || exit 1
     if [ "$KIND" = secondmate ]; then
       # The home's own daemon and crew call the same server, so they read the
-      # primary's credential through a link rather than a copy of the secret.
+      # credential this spawn used through a link rather than a copy of the
+      # secret. A remote home's CONFIG is the home's own config, so the source
+      # is the credential the adapter reads (FM_T3CODE_TOKEN_FILE names the code
+      # root's there), and a link onto itself or over a real credential file is
+      # refused rather than destroying that credential.
       T3CODE_HOME_ENV=1
-      if ! { mkdir -p "$PROJ_ABS/config" &&
-        ln -sfn "$(cd "$CONFIG" && pwd -P)/t3code-token" "$PROJ_ABS/config/t3code-token"; }; then
+      t3_token_src=$(fm_backend_t3code_token_file)
+      t3_token_src="$(cd "$(dirname "$t3_token_src")" 2>/dev/null && pwd -P)/$(basename "$t3_token_src")"
+      t3_token_dst="$PROJ_ABS/config/t3code-token"
+      if ! mkdir -p "$PROJ_ABS/config"; then
+        echo "error: could not link the T3 credential into $PROJ_ABS/config for $ID" >&2
+        exit 1
+      fi
+      if [ "$t3_token_src" = "$(cd "$PROJ_ABS/config" && pwd -P)/t3code-token" ]; then
+        echo "error: the T3 credential for $ID resolves to the home's own $t3_token_dst; set FM_T3CODE_TOKEN_FILE to the shared credential instead of linking it onto itself" >&2
+        exit 1
+      fi
+      if [ -e "$t3_token_dst" ] && [ ! -L "$t3_token_dst" ]; then
+        echo "error: $t3_token_dst is a real credential file, not a link; refusing to replace it - move it aside or remove it, then retry" >&2
+        exit 1
+      fi
+      if ! ln -sfn "$t3_token_src" "$t3_token_dst"; then
         echo "error: could not link the T3 credential into $PROJ_ABS/config for $ID" >&2
         exit 1
       fi

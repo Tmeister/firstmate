@@ -990,6 +990,29 @@ test_remote_full_probe_legacy_record_defaults_herdr() {
   pass "full probe: a record without remote_backend stays a herdr route"
 }
 
+test_remote_probe_t3code_route() {
+  local w out
+  w=$(make_remote_probe_world_rex probe-t3code)
+  sed -i.bak '/^remote_backend=/d;/^remote_rex_/d;/^remote_target=/d' "$w/home/state/rsm1.meta"
+  rm -f "$w/home/state/rsm1.meta.bak"
+  printf 'remote_backend=t3code\nremote_target=thread-remote-1\n' >> "$w/home/state/rsm1.meta"
+
+  # A live T3 route passes the T3 readiness gate and the route re-check.
+  out=$(probe_remote "$w" full FM_FAKE_ROUTE_BACKEND=t3code FM_FAKE_ROUTE_TARGET=thread-remote-1)
+  [ "$out" = 'alive|alive|0|||' ] || fail "a live T3 route should stay alive, got: $out"
+  grep -q -- '--backend t3code' "$w/ssh.log" \
+    || fail "the readiness gate did not ask the remote doctor about t3code: $(cat "$w/ssh.log")"
+
+  # A failed T3 run is relaunchable on its host, which resumes it in place.
+  out=$(probe_remote "$w" poll FM_FAKE_REMOTE_REPLY=dead)
+  [ "$out" = 'relaunchable|dead|0|a failed run on its remote T3 thread, resumed in place by its host|host=lab-host|' ] \
+    || fail "a failed remote T3 run should be resumed on its host, got: $out"
+  out=$(probe_remote "$w" poll FM_FAKE_REMOTE_REPLY=missing)
+  [ "$out" = 'relaunchable|missing|0|remote endpoint missing on its configured host|host=lab-host|' ] \
+    || fail "a missing remote T3 thread should be replaced on its host, got: $out"
+  pass "remote probe: a T3 route is gated on t3code readiness and a failed run resumes on its host"
+}
+
 test_tmux_agent_state_classifies
 test_tmux_agent_state_rejects_malformed_targets_before_probe
 test_herdr_agent_state_preserves_husk_classifier
@@ -1018,5 +1041,6 @@ test_remote_full_probe_rex_route
 test_remote_full_probe_rex_backend_drift
 test_remote_full_probe_rex_readiness_verdicts
 test_remote_full_probe_legacy_record_defaults_herdr
+test_remote_probe_t3code_route
 
 echo "# all fm-secondmate-liveness tests passed"
