@@ -749,6 +749,12 @@ if [ "$READ_ONLY" -eq 0 ]; then
   [ "$REEMIT" -eq 0 ] || NETWORK_STAGE_LOCKED=0
   "$SCRIPT_DIR/fm-startup-network.sh" start \
     --locked "$NETWORK_STAGE_LOCKED" --harvest-pid $$ >/dev/null 2>&1 || true
+  # The opt-in T3 doorbell (bin/fm-t3-bell.sh): a file test when off, and when
+  # on it detaches at once and resolves its T3 thread off this blocking path.
+  if [ "$REEMIT" -eq 0 ] && [ -f "$CONFIG/t3-bell" ]; then
+    FM_HOME="$FM_HOME" FM_CONFIG_OVERRIDE="$CONFIG" FM_STATE_OVERRIDE="$STATE" \
+      "$SCRIPT_DIR/fm-t3-bell.sh" start --no-wait >/dev/null 2>&1 || true
+  fi
 fi
 
 # --- 2. bootstrap --------------------------------------------------------
