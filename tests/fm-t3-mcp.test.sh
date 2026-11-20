@@ -391,6 +391,55 @@ test_launch_refusals() {
   pass "fm-t3-mcp launch: refuses a binding T3 did not honor, reports a lost, unproven, or unarchived launch as uncertain, and a gate failure as no launch"
 }
 
+t3_fake_thread_count() {  # -> how many threads the world holds
+  node -e 'const w = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); process.stdout.write(String(Object.keys(w.threads ?? {}).length))' "$T3_FAKE_WORLD"
+}
+
+test_launch_retries_lost_reply_with_client_request_id() {
+  local project calls id
+  fresh_case launch-idempotent '{"launchClientRequestId":true}'
+  mcp project-ensure --root "$TMP_ROOT/proj"
+  project=$(field "$OUT" projectId)
+  t3_fake_set 'w.dropReplyTools = { t3_thread_launch: 1 }'
+  : > "$T3_FAKE_LOG"
+  mcp launch --project "$project" --title fm-a --model-selection "$SEL" --worktree "$WT"
+  expect_code 0 "$RC" "a lost launch reply is retried under the same client request id: $ERR"
+  calls=$(t3_fake_calls t3_thread_launch)
+  assert_equals 2 "$(printf '%s\n' "$calls" | grep -c .)" "the lost reply is followed by exactly one retry"
+  id=$(field "$(printf '%s\n' "$calls" | head -1)" clientRequestId)
+  case "$id" in fm-launch-*) ;; *) fail "a launch on a T3 that takes clientRequestId sends one, got '$id'" ;; esac
+  assert_equals "$id" "$(field "$(printf '%s\n' "$calls" | tail -1)" clientRequestId)" "the retry reuses the first call's client request id"
+  assert_equals 1 "$(t3_fake_thread_count)" "the launch and its retry are one thread"
+  t3_fake_set 'w.rpcErrorTools = { t3_thread_launch: -32603 }'
+  mcp launch --project "$project" --title fm-b --model-selection "$SEL" --worktree "$WT"
+  expect_code 0 "$RC" "a JSON-RPC server error after the launch committed is retried: $ERR"
+  assert_equals 2 "$(t3_fake_thread_count)" "the retried launch is still one thread"
+  t3_fake_set 'w.dropReplyTools = { t3_thread_launch: 3 }'
+  : > "$T3_FAKE_LOG"
+  mcp launch --project "$project" --title fm-c --model-selection "$SEL" --worktree "$WT"
+  expect_code 1 "$RC" "a launch whose every retry lost its reply stays an uncertain outcome"
+  assert_equals 3 "$(t3_fake_calls t3_thread_launch | grep -c .)" "a launch makes at most three calls"
+  id=$(field "$OUT" error.clientRequestId)
+  case "$id" in fm-launch-*) ;; *) fail "an unproven launch names its client request id, got '$OUT'" ;; esac
+  assert_equals 3 "$(t3_fake_thread_count)" "every retry resolved to the one thread the first call created"
+  t3_fake_set 'w.dropReplyTools = {}; w.failTools = { t3_thread_launch: { code: "project_not_found", message: "no" } }'
+  : > "$T3_FAKE_LOG"
+  mcp launch --project "$project" --title fm-d --model-selection "$SEL" --worktree "$WT"
+  expect_code 3 "$RC" "T3's own typed refusal of a launch is not retried"
+  assert_equals 1 "$(t3_fake_calls t3_thread_launch | grep -c .)" "a typed refusal makes one call"
+  fresh_case launch-legacy-id
+  mcp project-ensure --root "$TMP_ROOT/proj"
+  project=$(field "$OUT" projectId)
+  t3_fake_set 'w.dropReplyTools = { t3_thread_launch: 1 }'
+  : > "$T3_FAKE_LOG"
+  mcp launch --project "$project" --title fm-e --model-selection "$SEL" --worktree "$WT"
+  expect_code 1 "$RC" "a T3 without launch clientRequestId never retries a lost reply"
+  calls=$(t3_fake_calls t3_thread_launch)
+  assert_equals 1 "$(printf '%s\n' "$calls" | grep -c .)" "an older T3 is called once"
+  assert_equals "" "$(field "$calls" clientRequestId)" "an older T3 is not sent a clientRequestId"
+  pass "fm-t3-mcp launch: retries a lost reply under one client request id when T3 takes it, and never retries on an older T3"
+}
+
 new_thread() {  # -> thread id
   local project
   mcp project-ensure --root "$TMP_ROOT/proj"
@@ -950,6 +999,7 @@ test_revoked_credential_refused
 test_projects_by_real_path
 test_launch_binds_workspace
 test_launch_refusals
+test_launch_retries_lost_reply_with_client_request_id
 test_send_state_capture_interrupt_archive
 test_thread_for_root
 test_typed_failure_and_transport_errors

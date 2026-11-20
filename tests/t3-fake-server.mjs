@@ -35,7 +35,9 @@
 //   tokens (accepted bearers; sign-in appends), environmentId, serverVersion,
 //   tools (array of names; default all), legacy (serve T3 0.1.0's tools and
 //   catalog), omitModels (model ids the compact catalog leaves out of its
-//   short list), revoked (every /mcp call is 401),
+//   short list), launchClientRequestId (t3_thread_launch lists and honors
+//   clientRequestId: a repeat with the same id answers the thread it
+//   already launched), revoked (every /mcp call is 401),
 //   sse (SSE replies), expiresIn (seconds), bindWorktree, bindInstance,
 //   bindRuntimeMode, bindModel, bindOptions (override what a launch binds),
 //   archiveKeepsRun (archive never ends the run), interruptStuck or
@@ -244,6 +246,8 @@ async function callTool(w, name, a) {
       return [ok(p), true];
     }
     case "t3_thread_launch": {
+      w.launchIds = w.launchIds ?? {};
+      if (w.launchClientRequestId && a.clientRequestId && w.launchIds[a.clientRequestId]) return [ok(w.launchIds[a.clientRequestId]), false];
       const ws = a.workspaceStrategy ?? {};
       const id = `mcp:${randomUUID()}`;
       const sel = a.modelSelection ?? {};
@@ -261,7 +265,9 @@ async function callTool(w, name, a) {
       };
       threads[id] = n;
       if (a.message) startRun(n, a.message);
-      return [ok({ threadId: id, projectId: n.projectId, runId: n.activeRunId, status: n.status }), true];
+      const out = { threadId: id, projectId: n.projectId, runId: n.activeRunId, status: n.status };
+      if (w.launchClientRequestId && a.clientRequestId) w.launchIds[a.clientRequestId] = out;
+      return [ok(out), true];
     }
     case "t3_thread_send": {
       if (!t) return [notFound(a.threadId), false];
@@ -402,7 +408,8 @@ async function mcp(req, res) {
     res.writeHead(202);
     return res.end();
   } else if (msg.method === "tools/list") {
-    result = { tools: listedTools(w).map((name) => ({ name, inputSchema: { type: "object" } })) };
+    const schema = (name) => (name === "t3_thread_launch" && w.launchClientRequestId ? { type: "object", properties: { clientRequestId: { type: "string" } } } : { type: "object" });
+    result = { tools: listedTools(w).map((name) => ({ name, inputSchema: schema(name) })) };
   } else if (msg.method === "tools/call") {
     let changed = settle(w);
     let mutated;

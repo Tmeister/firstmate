@@ -54,7 +54,13 @@
 //     catch-all orchestration_error can follow a created thread, so it exits
 //     1 as well. A transport or unexpected failure of the
 //     gate, before t3_thread_launch is requested, exits 8: no thread was
-//     launched. Without --message-file the thread is created idle.
+//     launched. When the gate lists clientRequestId in t3_thread_launch's
+//     input schema, the launch carries one fresh id and a lost reply, a
+//     JSON-RPC server error, or orchestration_error is retried with that same
+//     id, which T3 resolves to the same thread, up to 3 calls; a launch still
+//     unproven then exits 1 and names the id in error.clientRequestId. An
+//     older T3 is called once. Without --message-file the thread is created
+//     idle.
 //   fm-t3-mcp.mjs send --thread <id> --message-file <file> --client-request-id <id>
 //     t3_thread_send mode auto: start an idle thread's next turn or steer the
 //     running one. T3 derives the message and command ids from the client
@@ -185,6 +191,9 @@ const DAY_MS = 86_400_000;
 const REQUEST_TIMEOUT_MS = 30_000;
 const ARCHIVE_TIMEOUT_MS = /^[1-9][0-9]*$/.test(process.env.FM_T3CODE_ARCHIVE_TIMEOUT_MS ?? "") ? Number(process.env.FM_T3CODE_ARCHIVE_TIMEOUT_MS) : 15_000;
 const SESSION_CLOSE_TIMEOUT_MS = 2_000;
+// Calls one launch may make with its clientRequestId before its outcome is
+// reported unproven.
+const LAUNCH_ATTEMPTS = 3;
 // Node's fetch drops a reply that takes longer than 300 s, so one
 // t3_thread_wait, plus its 15 s grace, stays under that and a longer wait
 // re-arms until its own deadline.
@@ -372,8 +381,9 @@ export class McpSession {
     this.nextId = 1;
     this.timeoutMs = timeoutMs;
     this.server = null;
-    // The tool names the gate saw listed.
+    // The tool names the gate saw listed, and each one's input schema.
     this.tools = new Set();
+    this.schemas = new Map();
     SESSIONS.add(this);
   }
 
@@ -510,6 +520,7 @@ export async function gate(session, cred) {
   const listed = await session.rpc("tools/list", {});
   const names = new Set((listed?.tools ?? []).map((t) => t.name));
   session.tools = names;
+  session.schemas = new Map((listed?.tools ?? []).map((t) => [t.name, t.inputSchema ?? null]));
   const version = server?.serverInfo?.version ?? null;
   const missing = REQUIRED_TOOLS.filter((t) => !names.has(t));
   for (const [merged, replaced] of Object.entries(MERGED_TOOLS)) {
@@ -898,14 +909,24 @@ async function launch(flags) {
     workspaceStrategy,
     ...(message ? { message } : {}),
   };
+  // A T3 whose launch takes clientRequestId makes a repeat with the same id
+  // the same launch, so a lost reply is retried; without it nothing is.
+  const idempotent = Boolean(session.schemas.get("t3_thread_launch")?.properties?.clientRequestId);
+  if (idempotent) args.clientRequestId = `fm-launch-${Date.now()}-${randomBytes(8).toString("hex")}`;
   let out;
-  try {
-    out = await session.call("t3_thread_launch", args);
-  } catch (err) {
-    if (err instanceof Refusal && err.code === UNPROVEN_TOOL_ERROR) {
-      throw new Refusal("launch_unconfirmed", `${err.message}, which can follow a created thread; inspect t3_thread_list before retrying`, 1);
+  for (let attempt = 1; ; attempt++) {
+    try {
+      out = await session.call("t3_thread_launch", args);
+      break;
+    } catch (err) {
+      const unproven = err instanceof Refusal && (err.code === UNPROVEN_TOOL_ERROR || err.exit === 1);
+      if (idempotent && unproven && attempt < LAUNCH_ATTEMPTS) continue;
+      if (err instanceof Refusal && err.code === UNPROVEN_TOOL_ERROR) {
+        throw new Refusal("launch_unconfirmed", `${err.message}, which can follow a created thread; inspect t3_thread_list before retrying`, 1, idempotent ? { clientRequestId: args.clientRequestId } : {});
+      }
+      if (idempotent && unproven) err.extra = { ...err.extra, clientRequestId: args.clientRequestId };
+      throw err;
     }
-    throw err;
   }
   if (!out?.threadId) throw new Refusal("launch_unconfirmed", "t3_thread_launch returned no threadId; inspect t3_thread_list before retrying", 1);
   const archiveLaunched = () => archiveThread(session, out.threadId, ARCHIVE_TIMEOUT_MS).then((r) => r.archived === true, () => false);
