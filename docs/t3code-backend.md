@@ -54,6 +54,7 @@ Under T3's narrower modes Codex's sandbox blocks that write and Claude parks on 
 The credential is much narrower than T3's administrative bearer from `t3 auth session issue`, which this backend no longer uses; T3 accepts an `mcp-client` session only on `/mcp`.
 
 The credential, the server's origin, its environment id, and its version are written to the local, gitignored `config/t3code-token`, mode 0600.
+A non-empty `FM_T3CODE_TOKEN_FILE` names another credential file instead, for the helper and the backend adapter alike.
 A missing credential refuses with an error that names the sign-in command; an expired, revoked, or incomplete one asks the captain to sign in again, an over-readable one asks for `chmod 600` or a fresh sign-in, and one that is not valid JSON names the parse error.
 A secondmate spawned on this backend gets `config/t3code-token` as a symlink to the primary's credential file, so its own daemon and crew use the same credential without a copy of the secret, and a fresh sign-in reaches them.
 Teardown removes that link, with the rest of the T3 environment the spawn wrote into the home, before a pooled home returns to the pool.
@@ -71,6 +72,8 @@ Revoke it with `t3 auth session revoke <id>` and delete `config/t3code-token` wh
 Spawn resolves the selection against T3's own catalog (`orchestrator_capabilities`) before anything is leased: the instance must exist, be usable, and run the harness's driver (`claudeAgent` for claude, `codex` for codex), so a mapping onto another driver's instance is refused.
 The file is part of the primary's inherited local material, so every secondmate home receives the primary's mapping and its own T3 workers launch on the same provider instances; a home without the file falls back to those bare defaults, which need not name a configured account.
 A task's `--model` must be a model that instance lists in T3's catalog.
+When `omittedModels` is positive, the adapter searches for a missing model by id.
+The result must match both the selected instance and the exact model id.
 `--model default` uses the T3 project's default model only when its instance matches `config/t3code-instances`; otherwise it refuses and asks for an explicit `--model`.
 `--effort` rides as the driver's reasoning option, `effort` for claude and `reasoningEffort` for codex, and must be one of the values the catalog lists for that model.
 An effort replaces only that option: `--model default` keeps every other project default option, such as Codex's service tier or Claude's fast mode, while an explicit model sends only the effort.
@@ -78,9 +81,17 @@ Every selected option is checked against the model's catalog descriptors.
 
 ### Capability gate
 
-Every call first runs `tools/list` and refuses unless T3 offers every tool in `REQUIRED_TOOLS` in `bin/fm-t3-mcp.mjs` (the thread, project, configuration, pending-request, and catalog tools) and `t3_environment_read`.
-It then refuses unless `t3_environment_read` reports the environment id recorded at sign-in, so a different T3 server behind the same address is never driven with this credential.
-A refusal names the missing tool or both environment ids, and spawn, control, and teardown stop before their first mutation.
+Every call runs `tools/list` through an authenticated MCP session, including sign-in after the token exchange.
+The required thread, project, and catalog tools are defined by `REQUIRED_TOOLS` in `bin/fm-t3-mcp.mjs`.
+The gate also requires `t3_environment_read` and the configuration and pending-request capabilities defined by `MERGED_TOOLS`.
+For each merged tool, the gate accepts either that tool or every tool it replaced.
+The adapter prefers `t3_thread_configuration` when present and otherwise reads configuration through `t3_thread_configure`.
+Pending-request calls prefer `t3_pending_request` and otherwise use the three `t3_pending_request_*` tools.
+
+The gate then refuses if `t3_environment_read` reports a different environment id from the one recorded at sign-in.
+This prevents the adapter from driving another T3 server behind the same address.
+A refusal names the missing tool or both environment ids.
+Spawn, control, and teardown stop before their first mutation.
 This gate replaces the HTTP dispatch probe and version floor of the pre-V2 transport, which T3 0.0.46 removed.
 
 ## Task shape and metadata
@@ -121,7 +132,9 @@ A `claude` task checks the leased worktree and refuses a tracked, existing, or s
 ## Current lifecycle and safety
 
 Spawn matches the project (the home, for a secondmate) by real path against T3's live projects, creating one titled `fm-<directory name>` with `t3_project_create` when absent, and leases the worktree for a worker.
-It then launches an idle thread with `t3_thread_launch` (the workspace strategy and branch, `full-access` runtime mode, the model selection) and reads the thread and its `t3_thread_configuration` back; a thread T3 bound to another workspace, runtime mode, instance, model, or option value is archived and the spawn refuses.
+It then launches an idle thread with `t3_thread_launch`, supplying the workspace strategy, branch, `full-access` runtime mode, and model selection.
+It reads back the thread and its configuration through the [selected configuration reader](#capability-gate).
+If T3 binds another workspace, runtime mode, instance, model, or requested option value, the adapter archives the thread and refuses the spawn.
 It installs the harness hooks, records metadata, installs the [per-directory harness environment](#per-directory-harness-environment), and sends the encoded brief (the charter, for a secondmate) as the thread's first message with `t3_thread_send`.
 Exact call payloads are owned by `bin/fm-t3-mcp.mjs` and `bin/backends/t3code.sh`.
 
@@ -166,7 +179,8 @@ Secondmate retirement requires `lsof` to prove the home is quiet; without it, te
 If spawn aborts after launching the thread and before T3 accepts its launch brief, including when T3 refuses the brief, cleanup uses the same proven close and keeps the lease when it fails, then prints the manual archive, environment-removal, and `treehouse return --force` steps.
 After a proven close it removes the environment files the spawn wrote into the slot or secondmate home, as teardown does, and keeps a worker's lease when that fails.
 Spawn freshens a leased slot before launching its thread, so a slot it cannot bring current never gets a thread: a slot that is not clean (uncommitted work or a stale submodule checkout) keeps its lease, and spawn prints the manual `treehouse return --force` step; after any other refresh failure, including an uninspectable worktree or an unreachable origin, the slot is returned.
-`t3_thread_launch` has no idempotency key, so a lost launch reply, T3's catch-all `orchestration_error` or a tool error without a code, or a failed binding read-back leaves ownership uncertain: spawn keeps the lease and never retries.
+When T3's `t3_thread_launch` lists `clientRequestId` in its input schema, the helper sends one fresh id per launch and retries a lost reply, a JSON-RPC server error, or `orchestration_error` with that same id, which T3 resolves to the same thread, up to three calls.
+On an older T3 that lacks it, or once those calls are spent, a lost launch reply, T3's catch-all `orchestration_error` or a tool error without a code, or a failed binding read-back leaves ownership uncertain: spawn keeps the lease and never retries.
 A gate failure before `t3_thread_launch` is requested launched nothing, so spawn returns the lease.
 A leased path that fails the worktree isolation check may be the spawning checkout itself, so spawn neither cleans nor returns it and prints the manual `treehouse return --force` step to run once it is inspected.
 When the thread id is known, the helper archives it and reports its id and whether it then read back archived with no active run, but the lease stays held either way until it is released by hand.
@@ -211,8 +225,12 @@ The poll loop, its wedge timer, and the `FM_BUSY_TURN_MAX_SECS` bound on a runni
 Secondmate threads stay off the splice, as on Herdr.
 In a home that also records Herdr or Rex workers, that backend keeps the push wait and the T3 workers stay on the poll loop, so adding a T3 task never slows Herdr or Rex escalation.
 
-Read and answer a worker's pending questions with [`bin/fm-t3-answer.sh`](../bin/fm-t3-answer.sh), which uses T3's `t3_pending_request_*` tools.
-Those tools list and answer questions only; a permission approval is visible through `t3_thread_read`'s activity view as an `approval_request` item, which is how the wake identifies it, but no `/mcp` tool answers it, so it is surfaced as a count and answered only in T3 Code itself.
+Read and answer a worker's pending questions with [`bin/fm-t3-answer.sh`](../bin/fm-t3-answer.sh).
+It uses the pending-request API selected by the [capability gate](#capability-gate).
+That API lists and answers questions only.
+A permission approval appears in the `t3_thread_read` activity view as an `approval_request` item, which the wake uses to identify it.
+The adapter reports an approval count, but no `/mcp` tool answers permission approvals.
+Answer them in T3 Code itself.
 
 <a id="away-mode"></a>
 

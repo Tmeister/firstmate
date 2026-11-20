@@ -35,7 +35,8 @@
 //     The model selection a launch sends, resolved against T3's own catalog
 //     (orchestrator_capabilities): the instance must exist, be usable, and run
 //     the harness's driver (claude: claudeAgent, codex: codex); the model must
-//     be one that instance lists; model default takes the project's default
+//     be one that instance lists, searched for by id when T3 omits it from
+//     its short list; model default takes the project's default
 //     selection, which must name the same instance. A non-default effort
 //     replaces only the driver's reasoning option (claude: effort, codex:
 //     reasoningEffort) and keeps every other default option; every option is
@@ -44,7 +45,7 @@
 //       [--worktree <abs-path>] [--branch <name>] [--message-file <file>]
 //     t3_thread_launch at runtimeMode full-access. With --worktree the
 //     workspace strategy is existing_worktree; without it, root (the project's
-//     own checkout). Reads the thread and its t3_thread_configuration back and
+//     own checkout). Reads the thread and its configuration back and
 //     archives and refuses it unless T3 bound exactly that workspace, full
 //     access, instance, model, and every requested option value; a refused
 //     thread that does not then read back archived with no active run exits
@@ -53,7 +54,13 @@
 //     catch-all orchestration_error can follow a created thread, so it exits
 //     1 as well. A transport or unexpected failure of the
 //     gate, before t3_thread_launch is requested, exits 8: no thread was
-//     launched. Without --message-file the thread is created idle.
+//     launched. When the gate lists clientRequestId in t3_thread_launch's
+//     input schema, the launch carries one fresh id and a lost reply, a
+//     JSON-RPC server error, or orchestration_error is retried with that same
+//     id, which T3 resolves to the same thread, up to 3 calls; a launch still
+//     unproven then exits 1 and names the id in error.clientRequestId. An
+//     older T3 is called once. Without --message-file the thread is created
+//     idle.
 //   fm-t3-mcp.mjs send --thread <id> --message-file <file> --client-request-id <id>
 //     t3_thread_send mode auto: start an idle thread's next turn or steer the
 //     running one. T3 derives the message and command ids from the client
@@ -91,13 +98,13 @@
 //     different run). T3 ends the run asynchronously after the request.
 //   fm-t3-mcp.mjs requests --thread <id>
 //     The thread's pending runtime requests: questions (each user-input
-//     request id with its questions, from t3_pending_request_list/read) and
+//     request id with its questions, from T3's pending-request list and read) and
 //     approvals, the count of pending requests those tools cannot see or
 //     answer (permission approvals, answered only in T3 Code itself). The
 //     signature names the question ids, the approval count, and the activity
 //     item id of each approval T3 shows among the thread's last 100 items.
 //   fm-t3-mcp.mjs respond --thread <id> --request <request-id> --answers-file <file>
-//     t3_pending_request_respond with the JSON object in <file>, keyed by
+//     T3's pending-request respond with the JSON object in <file>, keyed by
 //     question id. It cannot approve a permission request.
 //   fm-t3-mcp.mjs watch --thread <id>... --timeout-ms <n> [--escalated <id>=<signature>]...
 //     The T3 event wait for the watcher. It first reads every thread: one
@@ -127,10 +134,11 @@
 // with FM_HOME defaulting to this repository.
 //
 // The capability gate (every verb, login included) runs tools/list and refuses
-// unless all of REQUIRED_TOOLS and t3_environment_read are present, then reads
-// t3_environment_read and refuses unless its environmentId equals the one
-// recorded at sign-in, so a different T3 on the same origin is never driven
-// with this credential.
+// unless all of REQUIRED_TOOLS and t3_environment_read are present and each
+// MERGED_TOOLS entry is listed as the merged tool or as every tool it
+// replaced, then reads t3_environment_read and refuses unless its
+// environmentId equals the one recorded at sign-in, so a different T3 on the
+// same origin is never driven with this credential.
 //
 // FM_T3CODE_ARCHIVE_TIMEOUT_MS, a positive integer, replaces the 15000 ms bound
 // on the read-back that proves an archive (launch's cleanup archive, and
@@ -167,20 +175,25 @@ export const REQUIRED_TOOLS = [
   "t3_thread_interrupt",
   "t3_thread_organize",
   "t3_thread_list",
-  "t3_thread_configuration",
   "t3_project_list",
   "t3_project_create",
-  "t3_pending_request_list",
-  "t3_pending_request_read",
-  "t3_pending_request_respond",
   "orchestrator_capabilities",
 ];
+export const MERGED_TOOLS = {
+  // The merged configure tool supports reads without modelSelection.
+  t3_thread_configure: ["t3_thread_configuration"],
+  // Takes action list, read, or respond.
+  t3_pending_request: ["t3_pending_request_list", "t3_pending_request_read", "t3_pending_request_respond"],
+};
 const ENVIRONMENT_TOOL = "t3_environment_read";
 const EXPIRY_WARN_DAYS = 5;
 const DAY_MS = 86_400_000;
 const REQUEST_TIMEOUT_MS = 30_000;
 const ARCHIVE_TIMEOUT_MS = /^[1-9][0-9]*$/.test(process.env.FM_T3CODE_ARCHIVE_TIMEOUT_MS ?? "") ? Number(process.env.FM_T3CODE_ARCHIVE_TIMEOUT_MS) : 15_000;
 const SESSION_CLOSE_TIMEOUT_MS = 2_000;
+// Calls one launch may make with its clientRequestId before its outcome is
+// reported unproven.
+const LAUNCH_ATTEMPTS = 3;
 // Node's fetch drops a reply that takes longer than 300 s, so one
 // t3_thread_wait, plus its 15 s grace, stays under that and a longer wait
 // re-arms until its own deadline.
@@ -368,6 +381,9 @@ export class McpSession {
     this.nextId = 1;
     this.timeoutMs = timeoutMs;
     this.server = null;
+    // The tool names the gate saw listed, and each one's input schema.
+    this.tools = new Set();
+    this.schemas = new Map();
     SESSIONS.add(this);
   }
 
@@ -462,6 +478,18 @@ export class McpSession {
     }
     return data;
   }
+
+  // Prefer the dedicated reader: the legacy configure writer requires modelSelection.
+  async threadConfiguration(threadId) {
+    if (this.tools.has("t3_thread_configuration")) return this.call("t3_thread_configuration", { threadId });
+    return this.call("t3_thread_configure", { threadId });
+  }
+
+  // One pending-request action: list, read, or respond.
+  async pendingRequest(action, args) {
+    if (this.tools.has("t3_pending_request")) return this.call("t3_pending_request", { action, ...args });
+    return this.call(`t3_pending_request_${action}`, args);
+  }
 }
 
 function parseContentJson(content) {
@@ -491,8 +519,13 @@ export async function gate(session, cred) {
   const server = await session.open();
   const listed = await session.rpc("tools/list", {});
   const names = new Set((listed?.tools ?? []).map((t) => t.name));
+  session.tools = names;
+  session.schemas = new Map((listed?.tools ?? []).map((t) => [t.name, t.inputSchema ?? null]));
   const version = server?.serverInfo?.version ?? null;
   const missing = REQUIRED_TOOLS.filter((t) => !names.has(t));
+  for (const [merged, replaced] of Object.entries(MERGED_TOOLS)) {
+    if (!names.has(merged) && !replaced.every((t) => names.has(t))) missing.push(merged);
+  }
   if (missing.length) {
     throw new Refusal(
       "capability_gate",
@@ -761,14 +794,32 @@ function modelSelection(flags) {
   return sel;
 }
 
-// An option selection is valid when the model's catalog describes its id and,
-// for a select, lists its value; a boolean option takes a boolean.
+// The values an option descriptor allows. T3 0.1.3 and later list them as
+// `values`; 0.1.0 and the 0.0.46 nightlies give a typed descriptor whose
+// select choices are `options` and whose boolean takes true or false.
+function optionValues(descriptor) {
+  if (Array.isArray(descriptor.values)) return descriptor.values;
+  if (descriptor.type === "boolean") return [false, true];
+  return (descriptor.options ?? []).map((c) => c.id);
+}
+
+// An option selection is valid when the model's catalog describes its id and
+// lists its value.
 function optionProblem(model, option) {
   const descriptor = (model.options ?? []).find((d) => d.id === option.id);
   if (!descriptor) return `option '${option.id}' is not one model ${model.id} offers`;
-  if (descriptor.type === "boolean") return typeof option.value === "boolean" ? null : `option '${option.id}' takes true or false`;
-  const values = (descriptor.options ?? []).map((c) => c.id);
+  const values = optionValues(descriptor);
   return values.includes(option.value) ? null : `option '${option.id}' value '${option.value}' is not one of ${values.join(", ")} for model ${model.id}`;
+}
+
+// The instance's catalog entry for a model. T3 0.1.3 and later list a short
+// set and count the rest in omittedModels, which a search by id returns.
+async function catalogModel(session, provider, id) {
+  const listed = (provider.models ?? []).find((m) => m.id === id);
+  if (listed || !(provider.omittedModels > 0)) return listed ?? null;
+  const found = await session.call("orchestrator_capabilities", { search: id });
+  const same = (found?.providers ?? []).find((p) => p.providerInstanceId === provider.providerInstanceId);
+  return (same?.models ?? []).find((m) => m.id === id) ?? null;
 }
 
 async function resolveSelection(flags) {
@@ -798,7 +849,7 @@ async function resolveSelection(flags) {
     }
     base = { instanceId, model: def.model, ...(def.options !== undefined ? { options: def.options } : {}) };
   }
-  const model = (provider.models ?? []).find((m) => m.id === base.model);
+  const model = await catalogModel(session, provider, base.model);
   if (!model) throw new Refusal("model_unknown", `T3 instance '${instanceId}' does not list model '${base.model}'; pass --model with a slug from its catalog`);
   let options = base.options;
   if (effort !== "default") {
@@ -858,14 +909,24 @@ async function launch(flags) {
     workspaceStrategy,
     ...(message ? { message } : {}),
   };
+  // A T3 whose launch takes clientRequestId makes a repeat with the same id
+  // the same launch, so a lost reply is retried; without it nothing is.
+  const idempotent = Boolean(session.schemas.get("t3_thread_launch")?.properties?.clientRequestId);
+  if (idempotent) args.clientRequestId = `fm-launch-${Date.now()}-${randomBytes(8).toString("hex")}`;
   let out;
-  try {
-    out = await session.call("t3_thread_launch", args);
-  } catch (err) {
-    if (err instanceof Refusal && err.code === UNPROVEN_TOOL_ERROR) {
-      throw new Refusal("launch_unconfirmed", `${err.message}, which can follow a created thread; inspect t3_thread_list before retrying`, 1);
+  for (let attempt = 1; ; attempt++) {
+    try {
+      out = await session.call("t3_thread_launch", args);
+      break;
+    } catch (err) {
+      const unproven = err instanceof Refusal && (err.code === UNPROVEN_TOOL_ERROR || err.exit === 1);
+      if (idempotent && unproven && attempt < LAUNCH_ATTEMPTS) continue;
+      if (err instanceof Refusal && err.code === UNPROVEN_TOOL_ERROR) {
+        throw new Refusal("launch_unconfirmed", `${err.message}, which can follow a created thread; inspect t3_thread_list before retrying`, 1, idempotent ? { clientRequestId: args.clientRequestId } : {});
+      }
+      if (idempotent && unproven) err.extra = { ...err.extra, clientRequestId: args.clientRequestId };
+      throw err;
     }
-    throw err;
   }
   if (!out?.threadId) throw new Refusal("launch_unconfirmed", "t3_thread_launch returned no threadId; inspect t3_thread_list before retrying", 1);
   const archiveLaunched = () => archiveThread(session, out.threadId, ARCHIVE_TIMEOUT_MS).then((r) => r.archived === true, () => false);
@@ -874,7 +935,7 @@ async function launch(flags) {
   let config;
   try {
     t = threadOf(await session.call("t3_thread_read", { threadId: out.threadId, limit: 1, runLimit: 1 }));
-    config = await session.call("t3_thread_configuration", { threadId: out.threadId });
+    config = await session.threadConfiguration(out.threadId);
   } catch (e) {
     const archived = await archiveLaunched();
     throw new Refusal(
@@ -1045,7 +1106,7 @@ function threadOf(out) {
 async function pendingOf(session, threadId, t) {
   const count = t.pendingRequestCount ?? 0;
   if (!count) return { questions: [], approvals: 0, approvalIds: [] };
-  const listed = await session.call("t3_pending_request_list", { threadId });
+  const listed = await session.pendingRequest("list", { threadId });
   const ids = [...new Set(listed?.requestIds ?? [])].sort();
   const approvals = Math.max(0, count - ids.length);
   if (!approvals) return { questions: ids, approvals, approvalIds: [] };
@@ -1066,7 +1127,7 @@ async function requests(flags) {
   const pending = await pendingOf(session, threadId, t);
   const questions = [];
   for (const requestId of pending.questions) {
-    const q = await session.call("t3_pending_request_read", { threadId, requestId });
+    const q = await session.pendingRequest("read", { threadId, requestId });
     questions.push({ requestId, questions: q?.questions ?? [] });
   }
   return { ok: true, threadId, pendingRequestCount: t.pendingRequestCount ?? 0, questions, approvals: pending.approvals, signature: pendingSignature(pending) };
@@ -1084,7 +1145,7 @@ async function respond(flags) {
   }
   if (!answers || typeof answers !== "object" || Array.isArray(answers)) usage("--answers-file must hold a JSON object keyed by question id");
   const { session } = await verifiedSession(flags);
-  await session.call("t3_pending_request_respond", { threadId, requestId, answers });
+  await session.pendingRequest("respond", { threadId, requestId, answers });
   return { ok: true, threadId, requestId };
 }
 

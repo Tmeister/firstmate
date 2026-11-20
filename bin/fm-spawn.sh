@@ -1869,8 +1869,8 @@ spawn_abort_cleanup() {
   # outcome is unproven, the agent may be working there, so both are left in
   # place.
   if [ "$T3CODE_CREATE_UNCERTAIN" = 1 ]; then
-    # t3_thread_launch has no idempotency key, so a launch whose outcome was
-    # lost may have left a thread whose id never came back.
+    # A launch whose outcome stayed lost, after the helper's same-id retries
+    # where T3 supports them, may have left a thread whose id never came back.
     T3CODE_CREATE_UNCERTAIN=0
     T3CODE_HOME_ENV=0
     if [ "$T3CODE_LEASED" = 1 ]; then

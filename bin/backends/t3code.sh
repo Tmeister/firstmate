@@ -22,7 +22,9 @@
 #
 # Config (gitignored config/ of the active home):
 #   t3code-token      the mcp-client credential the captain's
-#                     `bin/fm-t3-mcp.mjs login` writes, mode 0600
+#                     `bin/fm-t3-mcp.mjs login` writes, mode 0600;
+#                     a non-empty FM_T3CODE_TOKEN_FILE names another file
+#                     instead, as it does for bin/fm-t3-mcp.mjs
 #   t3code-instances  optional `harness=instanceId` lines (claude=claudeAgent,
 #                     codex=codex by default)
 
@@ -41,6 +43,10 @@ fm_backend_t3code_config_dir() {
 }
 
 fm_backend_t3code_token_file() {
+  if [ -n "${FM_T3CODE_TOKEN_FILE:-}" ]; then
+    printf '%s' "$FM_T3CODE_TOKEN_FILE"
+    return
+  fi
   printf '%s/t3code-token' "$(fm_backend_t3code_config_dir)"
 }
 
