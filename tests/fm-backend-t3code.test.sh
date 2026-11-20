@@ -11,6 +11,8 @@ set -u
 # A fleet pane already carries GIT_CONFIG core.hooksPath. These cases set the
 # Git config they assert on themselves, so drop the inherited one before any git command.
 unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0 GIT_CONFIG_PARAMETERS
+# A caller's credential override would point every case at another file.
+unset FM_T3CODE_TOKEN_FILE
 
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -287,6 +289,29 @@ test_missing_credential_names_signin() {
   assert_contains "$out" "$CONFIG/t3code-token" "a missing credential must name the token file"
   [ ! -s "$LOG" ] || fail "a missing credential must not reach the server"
   pass "fm_backend_t3code_runtime_check: a missing credential names the sign-in"
+}
+
+test_token_file_override_names_the_credential() {
+  local out status other
+  t3_case token-file-override
+  other="$CASE_DIR/elsewhere/t3code-token"
+  mkdir -p "$(dirname "$other")"
+  mv "$CONFIG/t3code-token" "$other"
+  out=$(FM_T3CODE_TOKEN_FILE="$other" t3_run 'printf "%s\n" "$(fm_backend_t3code_token_file)"; fm_backend_t3code_runtime_check' 2>&1)
+  status=$?
+  [ "$status" -eq 0 ] || fail "runtime_check must use the credential FM_T3CODE_TOKEN_FILE names: $out"
+  assert_contains "$out" "$other" "the adapter's token file must be the one FM_T3CODE_TOKEN_FILE names"
+  assert_grep '"method":"tools/list"' "$LOG" "the overriding credential must reach the server"
+  rm -f "$other"
+  : > "$LOG"
+  out=$(FM_T3CODE_TOKEN_FILE="$other" t3_run 'fm_backend_t3code_runtime_check' 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "runtime_check must fail when the named credential is missing"
+  assert_contains "$out" "$other" "a missing overriding credential must name that file"
+  [ ! -s "$LOG" ] || fail "a missing overriding credential must not reach the server"
+  out=$(FM_T3CODE_TOKEN_FILE="" t3_run 'fm_backend_t3code_token_file')
+  assert_equals "$CONFIG/t3code-token" "$out" "an empty FM_T3CODE_TOKEN_FILE keeps the home's own credential"
+  pass "fm_backend_t3code token file: FM_T3CODE_TOKEN_FILE names the credential, as it does for fm-t3-mcp.mjs"
 }
 
 test_revoked_credential_names_signin() {
@@ -2748,6 +2773,7 @@ test_t3_stale_watcher completed surface
 test_t3_stale_watcher failed dead
 test_t3_stale_watcher running surface codex '' hung
 test_missing_credential_names_signin
+test_token_file_override_names_the_credential
 test_revoked_credential_names_signin
 test_capability_gate_refuses_control
 test_project_ensure_matches_realpath_or_creates
