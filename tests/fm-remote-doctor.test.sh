@@ -1399,3 +1399,103 @@ assert_contains "$DOCTOR_OUT" 'check remote-job-worker=ok:' \
 assert_not_contains "$DOCTOR_OUT" 'check herdr-server=' "the herdr server was checked for rex on linux"
 [ ! -s "$CASE_LAUNCHCTL_LOG" ] || fail "the linux rex path invoked launchctl"
 pass "a Linux host verifies rex without any Aqua-specific requirement"
+
+# --- the t3code backend: CLI, systemd service, linger, and the credential ------
+
+# shellcheck source=tests/t3-fake-lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/t3-fake-lib.sh"
+if ! command -v node >/dev/null 2>&1; then
+  echo "skip: node absent, so the t3code backend cases cannot run"
+  exit 0
+fi
+t3_fake_start "$TMP_ROOT/t3-server" T3CODE_TELEMETRY_ENABLED=false
+FM_FAKE_T3_PID=$T3_FAKE_PID
+export FM_FAKE_T3_PID
+
+# install_case_t3 <linger yes|no> <service active|enabled|absent>: the t3 and
+# node CLIs, fake systemctl/loginctl backed by state files, an lsof that names
+# the fake T3 server as its port's listener, and a fresh credential case.
+install_case_t3() {
+  local linger=$1 service=$2
+  ln -sf "$(command -v node)" "$CASE_BIN/node"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$CASE_BIN/t3"
+  printf '%s\n' "$linger" > "$CASE_STATE/linger"
+  printf '%s\n' "$service" > "$CASE_STATE/t3-service"
+  cat > "$CASE_BIN/loginctl" <<'SH'
+#!/usr/bin/env bash
+cat "$FM_FAKE_STATE/linger"
+SH
+  cat > "$CASE_BIN/systemctl" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FM_FAKE_STATE/systemctl.log"
+state=$(cat "$FM_FAKE_STATE/t3-service")
+case "$*" in
+  *is-active*) [ "$state" = active ] ;;
+  *is-enabled*) [ "$state" = active ] || [ "$state" = enabled ] ;;
+  *start*) [ "$state" = enabled ] && printf 'active\n' > "$FM_FAKE_STATE/t3-service" ;;
+  *) exit 1 ;;
+esac
+SH
+  cat > "$CASE_BIN/lsof" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$FM_FAKE_T3_PID"
+SH
+  chmod +x "$CASE_BIN/t3" "$CASE_BIN/loginctl" "$CASE_BIN/systemctl" "$CASE_BIN/lsof"
+  t3_fake_case "$CASE_DIR/t3" '{}'
+  FM_T3CODE_TOKEN_FILE="$CASE_DIR/t3code-token"
+  export FM_T3CODE_TOKEN_FILE
+}
+
+# A Linux host with T3 as an enabled, lingering user service and a fresh
+# loopback credential is ready.
+new_case Linux no-herdr
+install_case_t3 yes active
+t3_fake_credential "$FM_T3CODE_TOKEN_FILE"
+doctor --backend t3code
+expect_code 0 "$DOCTOR_RC" "a ready Linux T3 host was not ready: $DOCTOR_OUT"
+assert_contains "$DOCTOR_OUT" "required t3=$CASE_BIN/t3" "the t3 CLI was not reported as a required tool"
+assert_contains "$DOCTOR_OUT" 'check t3=ok:' "the t3 CLI was not detected"
+assert_contains "$DOCTOR_OUT" 'check t3-linger=ok:' "lingering was not confirmed"
+assert_contains "$DOCTOR_OUT" 'check t3-service=ok: t3code.service is active' "the active service was not confirmed"
+assert_contains "$DOCTOR_OUT" 'check t3-server=ok: T3 ' "the T3 server and credential were not confirmed"
+assert_contains "$DOCTOR_OUT" 'telemetry off' "telemetry off was not confirmed"
+assert_not_contains "$DOCTOR_OUT" 'check herdr=' "a t3code verification still ran the herdr checks"
+assert_not_contains "$DOCTOR_OUT" 'check rex=' "a t3code verification still ran the rex checks"
+pass "a Linux T3 host with a lingering service and a fresh credential is ready"
+
+# Linger off, a stopped unit, and no credential: --fix starts only the unit and
+# leaves linger and sign-in as human gaps with their exact steps.
+new_case Linux no-herdr
+install_case_t3 no enabled
+doctor --backend t3code
+expect_code 1 "$DOCTOR_RC" "a T3 host with gaps was reported ready"
+assert_contains "$DOCTOR_OUT" 'check t3-linger=human:' "linger off was not a human gap"
+assert_contains "$DOCTOR_OUT" "action: t3-linger: run 'sudo loginctl enable-linger" "linger action missing"
+assert_contains "$DOCTOR_OUT" 'check t3-service=fixable:' "a stopped unit was not fixable"
+assert_contains "$DOCTOR_OUT" 'check t3-server=human: no T3 credential' "a missing credential was not a human gap"
+assert_contains "$DOCTOR_OUT" "fm-t3-mcp.mjs' login --access full-access --token-file '$FM_T3CODE_TOKEN_FILE'" "the sign-in action was not exact"
+doctor --backend t3code --fix
+expect_code 1 "$DOCTOR_RC" "--fix reported a T3 host ready with human gaps left"
+assert_contains "$DOCTOR_OUT" 'fix t3-service=applied: started t3code.service' "--fix did not start the unit"
+assert_contains "$DOCTOR_OUT" 'check t3-service=ok:' "the started unit was not confirmed"
+assert_contains "$DOCTOR_OUT" 'check t3-linger=human:' "--fix claimed to fix linger"
+assert_contains "$DOCTOR_OUT" 'check t3-server=human:' "--fix claimed to sign in"
+assert_no_grep 'user enable ' "$CASE_STATE/systemctl.log" "--fix enabled or installed a unit"
+pass "--fix starts a stopped T3 unit and leaves linger and sign-in to a person"
+
+# A credential close to expiry is a human gap; a missing t3 CLI is too. macOS
+# has no systemd unit to check.
+new_case Darwin no-herdr gui
+install_case_t3 yes absent
+t3_fake_credential "$FM_T3CODE_TOKEN_FILE" env-fake-1 $(( ($(date +%s) + 2 * 86400) * 1000 ))
+doctor --backend t3code
+assert_contains "$DOCTOR_OUT" 'check t3-service=skip:' "macOS was checked for a systemd unit"
+assert_contains "$DOCTOR_OUT" 'check t3-server=human: the T3 credential expires in' "a near-expiry credential was not a human gap"
+rm -f "$CASE_BIN/t3"
+doctor --backend t3code
+expect_code 1 "$DOCTOR_RC" "a host without the t3 CLI was reported ready"
+assert_contains "$DOCTOR_OUT" 'check t3=human:' "a missing t3 CLI was not a human gap"
+assert_contains "$DOCTOR_OUT" 'required t3=MISSING' "the missing t3 CLI was not reported"
+pass "a near-expiry T3 credential and a missing t3 CLI are human gaps"
+unset FM_T3CODE_TOKEN_FILE
+t3_fake_stop

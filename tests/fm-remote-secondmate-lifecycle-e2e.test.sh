@@ -260,6 +260,14 @@ case "${FM_FAKE_SSH_MODE:-normal}:$command_name:$command_rel" in
     printf 'harness=codex\n'
     exit 0
     ;;
+  launch-t3code-route:fm-remote-secondmate-control.sh:*)
+    [ "$_command_action" = launch ] || exit 93
+    printf 'schema=fm-remote-secondmate-control.v1\n'
+    printf 'backend=t3code\n'
+    printf 'target=%s\n' "${FM_FAKE_T3_TARGET:-thread-remote-1}"
+    printf 'harness=codex\n'
+    exit 0
+    ;;
   provision-block-fail:fm-remote-home-provision.sh:*)
     touch "$FM_FAKE_SEED_ENTERED"
     while [ ! -f "$FM_FAKE_SEED_RELEASE" ]; do sleep 0.02; done
@@ -1494,12 +1502,12 @@ assert_grep 'not ready' "$TMP_ROOT/spawn-rex-old-doctor.out" \
 cmp -s "$TMP_ROOT/parent-ios-before-old-rex.meta" "$PARENT/state/ios.meta" \
   || fail "the refused rex spawn rewrote the recorded route"
 
-# An explicit backend outside {herdr, rex} is refused before any remote call.
+# An explicit backend outside {herdr, rex, t3code} is refused before any remote call.
 ssh_before=$(cat "$SSH_COUNT")
 if remote_env "$ROOT/bin/fm-spawn.sh" ios --secondmate --backend tmux >"$TMP_ROOT/spawn-tmux-backend.out" 2>&1; then
   fail "an unknown remote backend was accepted"
 fi
-assert_grep 'runs only on the herdr or rex backend' "$TMP_ROOT/spawn-tmux-backend.out" \
+assert_grep 'runs only on the herdr, rex, or t3code backend' "$TMP_ROOT/spawn-tmux-backend.out" \
   "an unknown remote backend did not fail with the backend refusal"
 [ "$(cat "$SSH_COUNT")" = "$ssh_before" ] || fail "an unknown remote backend still made a remote call"
 
@@ -1524,6 +1532,23 @@ assert_grep 'malformed Rex route metadata' "$TMP_ROOT/spawn-rex-mismatched.out" 
 cmp -s "$TMP_ROOT/parent-ios-pre-launch.meta" "$PARENT/state/ios.meta" \
   || fail "a refused rex session route rewrote the recorded route"
 pass "remote secondmate backend selection is strict on both sides of the boundary"
+
+# A T3 route records its thread id as the remote target; a malformed thread id
+# is refused at the parent boundary and leaves the recorded route untouched.
+if FM_FAKE_SSH_MODE=launch-t3code-route FM_FAKE_T3_TARGET='thread bad;id' remote_env "$ROOT/bin/fm-spawn.sh" ios --secondmate --backend t3code \
+  >"$TMP_ROOT/spawn-t3code-bad.out" 2>&1; then
+  fail "a T3 route with a malformed thread id was accepted"
+fi
+assert_grep 'malformed T3 thread id' "$TMP_ROOT/spawn-t3code-bad.out" \
+  "a malformed T3 thread id did not fail with the T3 refusal"
+cmp -s "$TMP_ROOT/parent-ios-pre-launch.meta" "$PARENT/state/ios.meta" \
+  || fail "a refused T3 route rewrote the recorded route"
+FM_FAKE_SSH_MODE=launch-t3code-route remote_env "$ROOT/bin/fm-spawn.sh" ios --secondmate --backend t3code \
+  >"$TMP_ROOT/spawn-t3code.out" 2>&1 || fail "a remote T3 route was refused: $(cat "$TMP_ROOT/spawn-t3code.out")"
+assert_grep 'remote_backend=t3code' "$PARENT/state/ios.meta" "the T3 launch did not record its backend"
+assert_grep 'remote_target=thread-remote-1' "$PARENT/state/ios.meta" "the T3 launch did not record its thread"
+cp "$TMP_ROOT/parent-ios-pre-launch.meta" "$PARENT/state/ios.meta"
+pass "a remote T3 route records its thread at the parent and refuses a malformed one"
 
 # The remote host itself launches on rex: with no recorded endpoint (a
 # never-launched route) the remote control script runs the host-local spawn on

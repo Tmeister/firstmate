@@ -2,7 +2,7 @@
 # Host-local lifecycle control for the remote secondmate home selected by fm-on.
 #
 # Usage:
-#   fm-remote-secondmate-control.sh launch <id> <harness> <model|-> <effort|-> {herdr|rex} [traceparent]
+#   fm-remote-secondmate-control.sh launch <id> <harness> <model|-> <effort|-> {herdr|rex|t3code} [traceparent]
 #   fm-remote-secondmate-control.sh relaunch <id> <harness> <model|default|-> <effort|default|->
 #   fm-remote-secondmate-control.sh state <id>
 #   fm-remote-secondmate-control.sh route <id>
@@ -18,7 +18,11 @@
 # Remote placement ends here, but the second-mate agent runs only on a session
 # backend whose server survives every SSH disconnection that supervises it:
 # herdr in this code root's remote session (bin/fm-remote-herdr-identity-lib.sh),
-# or rex in this home's 2ndmate-<id>-<hash> session on the personal rex server.
+# rex in this home's 2ndmate-<id>-<hash> session on the personal rex server,
+# or t3code on this host's own loopback T3 server, kept running by its system
+# service. Every remote T3 home on this host reads the code root's one
+# credential, config/t3code-token, through a link (FM_T3CODE_TOKEN_FILE below),
+# and a failed T3 run is resumed in place, never killed and replaced.
 # Launch refuses any other selection rather than reading this home's
 # config/backend. The user's interactive sessions remain for the user's work.
 # fm-spawn/fm-send/fm-teardown keep owning the local endpoint mechanics.
@@ -67,9 +71,12 @@ REMOTE_HERDR_SESSION=
 # cannot repair while it answers, so nothing this control plane runs may start
 # one: bin/fm-remote-doctor.sh --fix alone starts the persistent server.
 export FM_BACKEND_REX_NO_AUTOSTART=1
+# The code root's T3 credential is the one every remote T3 home on this host
+# shares; the host-local spawn links each home's config/t3code-token to it.
+export FM_T3CODE_TOKEN_FILE="${FM_T3CODE_TOKEN_FILE:-$FM_ROOT/config/t3code-token}"
 
 die() { printf 'error: %s\n' "$1" >&2; exit 1; }
-usage() { sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 validate_id() { case "$1" in ''|*[!A-Za-z0-9._-]*) die "invalid secondmate id: $1" ;; esac; }
 
 # Sourcing fm-wake-lib.sh through the libraries below creates "$FM_HOME/state",
@@ -158,8 +165,12 @@ remote_endpoint_load() {
           ;;
       esac
       ;;
+    t3code)
+      # The validator above binds the thread id; the server is this host's own
+      # loopback T3, proven by the credential's environment check on every call.
+      ;;
     *)
-      REMOTE_ENDPOINT_ERROR="remote secondmate $id endpoint is recorded on backend '$REMOTE_ENDPOINT_BACKEND'; a remote secondmate runs only on herdr or rex; refusing access until it is explicitly migrated"
+      REMOTE_ENDPOINT_ERROR="remote secondmate $id endpoint is recorded on backend '$REMOTE_ENDPOINT_BACKEND'; a remote secondmate runs only on herdr, rex, or t3code; refusing access until it is explicitly migrated"
       return 1
       ;;
   esac
@@ -262,7 +273,9 @@ cmd_launch() {
   # GUI login session, and a persistent `rex server start` server is a
   # detached daemon no SSH session owns. bin/fm-remote-doctor.sh is the
   # readiness owner for whichever backend the parent selected.
-  case "$selected_backend" in herdr|rex) ;; *) die "a remote secondmate runs only on the herdr or rex backend, not '$selected_backend'" ;; esac
+  # A T3 server is a system service on this host (bin/fm-remote-doctor.sh
+  # --backend t3code), so it too outlives every SSH session.
+  case "$selected_backend" in herdr|rex|t3code) ;; *) die "a remote secondmate runs only on the herdr, rex, or t3code backend, not '$selected_backend'" ;; esac
   mkdir -p "$CONTROL_STATE" "$CONTROL_DATA"
   meta=$(meta_path "$id")
   if [ -f "$meta" ]; then
@@ -285,10 +298,27 @@ cmd_launch() {
         return 0
         ;;
       dead)
+        if [ "$REMOTE_ENDPOINT_BACKEND" = t3code ]; then
+          # A failed T3 run leaves its thread and conversation readable, so it
+          # takes one recovery turn in place instead of being replaced.
+          if ! { fm_backend_source t3code && fm_backend_t3code_resume_failed "$REMOTE_ENDPOINT_TARGET" >/dev/null; }; then
+            die "could not resume the failed T3 thread $REMOTE_ENDPOINT_TARGET in place; it is left as recorded"
+          fi
+          print_route "$id"
+          return 0
+        fi
         fm_backend_kill "$REMOTE_ENDPOINT_BACKEND" "$REMOTE_ENDPOINT_TARGET" 2>/dev/null \
           || die "could not remove the confirmed agent-less endpoint"
         ;;
-      missing) ;;
+      missing)
+        # A T3 thread reads missing once archived, which T3 may still be
+        # finishing; the idempotent kill re-proves the close before a
+        # replacement thread is launched beside it.
+        if [ "$REMOTE_ENDPOINT_BACKEND" = t3code ]; then
+          fm_backend_kill t3code "$REMOTE_ENDPOINT_TARGET" 2>/dev/null \
+            || die "could not prove the missing T3 thread $REMOTE_ENDPOINT_TARGET closed; refusing a replacement beside it"
+        fi
+        ;;
       *) die "remote endpoint state is $current; refusing duplicate launch" ;;
     esac
   fi
@@ -349,6 +379,10 @@ cmd_relaunch() {
     "$SCRIPT_DIR/fm-harness.sh" validate-native-effort "$harness" "$model" "$effort" || return 1
   fi
   remote_endpoint_require "$id"
+  # A T3 thread keeps its conversation, so no fresh agent can be proven: a
+  # model or harness change on a T3 mate is retire, then launch.
+  [ "$REMOTE_ENDPOINT_BACKEND" != t3code ] \
+    || die "a T3 second mate cannot be relaunched; retire it, then launch it again with the new profile"
   [ "$model" != - ] || model=default
   [ "$effort" != - ] || effort=default
   control_args=("$id" relaunch --harness "$harness" --model "$model" --effort "$effort")

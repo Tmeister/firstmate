@@ -21,7 +21,7 @@ Firstmate does not support placing an individual worker remotely or failing a re
 
 ## Where the remote agent runs
 
-The remote second-mate agent runs on one of two session-provider backends, selected per launch.
+The remote second-mate agent runs on one of three session-provider backends, selected per launch.
 [Launch selection and placement](#launch-or-recover) define the backend contract.
 Provisioning checks any available supported backend; launch checks the selected one.
 
@@ -32,6 +32,9 @@ Provisioning checks any available supported backend; launch checks the selected 
 - A remote Rex endpoint requires a persistent rex server started with `rex server start`, which is a detached daemon no SSH session owns.
   An ephemeral `rex server run --exit-empty` server exits when its last session or control connection disappears, so it can never satisfy remote readiness.
 - [Rex's server-stop limits](rex-backend.md#active-limits) explain session restoration and agent recovery.
+- A remote T3 Code endpoint runs on the host's own loopback T3 server, which on Linux is the `t3code.service` systemd user unit with lingering on, so it survives logout and reboot.
+  Every remote T3 home on that host reads the code root's one credential, `config/t3code-token`, through a link; the credential is signed in on that host and never crosses SSH.
+  A link that would point at itself or replace a real credential file is refused.
 - Local second mates are unaffected and keep their ordinary backend and session selection.
   So do the workers a remote second mate supervises inside its own home.
 
@@ -230,10 +233,11 @@ Check any host against it directly:
 ```sh
 bin/fm-on.sh <secondmate-id|ssh-alias> fm-remote-doctor.sh
 bin/fm-on.sh <secondmate-id|ssh-alias> fm-remote-doctor.sh --backend rex
+bin/fm-on.sh <secondmate-id|ssh-alias> fm-remote-doctor.sh --backend t3code
 ```
 
-`--backend` names the session backend to verify: `herdr`, `rex`, or `any`.
-The default `any` resolves herdr when its CLI is present and rex otherwise, so a host offering both is verified for the default backend.
+`--backend` names the session backend to verify: `herdr`, `rex`, `t3code`, or `any`.
+The default `any` resolves herdr when its CLI is present and rex otherwise, so a host offering both is verified for the default backend; it never resolves `t3code`.
 The launch path passes the launch's own selection, so the gate a launch passes is the gate for the backend it will use.
 
 That run is read-only.
@@ -331,6 +335,7 @@ These steps are never automated and are always reported rather than silently att
 - FileVault, which holds a reboot at pre-boot authentication before any login session exists.
 - Installing any missing required tool that no safe wrapper can resolve.
 - Each worker runtime's own `/login`, and any keychain password prompt that login needs.
+- For T3 Code: installing T3, `t3 service install` with `T3CODE_HOST=127.0.0.1` and `T3CODE_TELEMETRY_ENABLED=false` in `~/.t3/service.env`, `sudo loginctl enable-linger <user>`, and the T3 sign-in, which T3 expires after 30 days with no refresh; the doctor's `action:` line prints the exact sign-in command and warns five days before expiry.
 
 Firstmate never writes an auto-login password, never changes FileVault, and never stores an account password.
 A file at `~/.local/bin/fm-remote-entrypoint.sh` that is not Firstmate's own symlink is reported for the operator to inspect and is never overwritten.
@@ -339,7 +344,7 @@ A file at `~/.local/bin/fm-remote-entrypoint.sh` that is not Firstmate's own sym
 
 | Requirement | Tools |
 | --- | --- |
-| Always required | `git`, `jq`, the selected backend's CLI (`herdr` or `rex`), compatible `tasks-axi`, and `treehouse` |
+| Always required | `git`, `jq`, the selected backend's CLI (`herdr`, `rex`, or `t3` plus `node`), compatible `tasks-axi`, and `treehouse` |
 | At least one of | `claude`, `codex`, `opencode`, `pi`, `pi-signed`, `grok`, `kimi`, or `omp` |
 | Additionally required on macOS | `lsof`, so the doctor and guard can prove which process owns the session socket |
 
@@ -443,17 +448,18 @@ The primary then takes these steps:
 3. It transfers the inherited-material allowlist.
 4. It asks the remote host to launch on that backend.
 
-A new route defaults to Herdr; pass `--backend rex` to select Rex.
+A new route defaults to Herdr; pass `--backend rex` to select Rex, or `--backend t3code` to select T3 Code.
 Without an explicit backend, a later launch or liveness recovery preserves the parent's recorded `remote_backend`; legacy records without that field use Herdr.
 An existing endpoint on a different backend is refused rather than migrated.
 Placement is per backend:
 
 - Herdr: all remote secondmates of one code root on a host share that root's remote session, `fm-remote` for the account's primary root, and retain separate `2ndmate-<id>` workspaces inside it.
 - Rex: each remote secondmate home gets its own `2ndmate-<id>-<hash>` session on the host's persistent personal rex server, the same placement rule a local secondmate home uses.
+- T3 Code: each remote secondmate home gets its own `fm-<home>` project on the host's T3 server and one thread at the home's root, the same placement a local T3 secondmate uses ([`t3code-backend.md`](t3code-backend.md)).
 
 ### Refused and unsupported launches
 
-- An explicit request for any backend other than herdr or rex is refused rather than honored, and the remote host refuses one too.
+- An explicit request for any backend other than herdr, rex, or t3code is refused rather than honored, and the remote host refuses one too.
 - An existing remote endpoint recorded outside its backend's contract - a Herdr session other than its code root's remote session, or a Rex route whose recorded server is not a local `unix://` endpoint - is classified as unverified and left untouched.
   Launch, liveness recovery, control, and retirement refuse it until an operator explicitly migrates it, instead of attempting a live cutover.
 - A launch after a host has drifted out of readiness fails with the doctor's own gap text instead of leaving a half-created endpoint.
@@ -470,6 +476,9 @@ The watcher's liveness tick applies the identical rule during ordinary supervisi
 - The remote endpoint is probed read-only once per cadence.
 - Only a positive `dead` or `missing` reply relaunches through that command.
 - An unreachable transport or inconclusive state is left untouched rather than replaced locally.
+
+On T3 Code a `dead` reading is a failed run whose thread still exists, so the host resumes it in place with one recovery turn rather than replacing it.
+Only a `missing` thread is replaced, after its close is proven again.
 
 ### Inventory reconcile for markerless routes
 
@@ -675,6 +684,7 @@ The primary passes `<harness> <model|default|-> <effort|default|->` explicitly, 
 It passes them explicitly because `config/secondmate-harness` is not inherited into a second mate's home, and the file on that host belongs to a different home.
 Letting the far side re-resolve it would silently move the mate onto another runtime.
 SSH exit 255 leaves completion unknown and the route preserved, exactly as every other verb here.
+A T3 second mate refuses `relaunch`, because a thread keeps its conversation and no fresh agent can be proven; retire it, then launch it again with the new profile.
 Move a live remote second mate onto a newly pinned harness, model, or effort with [`bin/fm-remote-secondmate-relaunch.sh`](../bin/fm-remote-secondmate-relaunch.sh) rather than calling `relaunch` through `fm-on.sh` directly: the host-local relaunch it drives can only rewrite the host's own endpoint record, so this wrapper reads the confirmed identity back from that record afterward and republishes the primary's own route metadata to match, the same way launch already records a fresh route.
 
 ### Firstmate code convergence
@@ -704,6 +714,7 @@ It refuses while any of these holds:
 
 Herdr retirement closes only the retiring secondmate's panes or `2ndmate-<id>` workspace in its code root's remote session, never the shared session or a sibling's workspace or panes.
 Rex retirement follows the [recorded-block and empty-session cleanup contract](rex-backend.md#cleanup-and-the-absence-proof), never stopping the shared server.
+T3 retirement follows the [T3 cleanup contract](t3code-backend.md#current-lifecycle-and-safety): it archives the thread, removes the home's T3 environment files and credential link, and needs `lsof` on the host.
 SSH exit 255 preserves both the route and local records because completion is unknown.
 `--force` remains the explicit discard path and requires the same captain authority as local secondmate discard.
 
